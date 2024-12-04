@@ -11,8 +11,11 @@
 
 #include <linux/bpf.h>
 #include <linux/in.h>
+#include <linux/types.h>
 #include <bpf/bpf_helpers.h>
 #include <xdp/xdp_helpers.h>
+#include <bpf/bpf_endian.h>
+// #include "vmlinux.h"
 
 #include "common_kern_user.h"
 
@@ -29,6 +32,48 @@
 #define VERDICT_MISS XDP_PASS
 #define FEATURE_OPMODE FEAT_ALLOW
 #endif
+
+typedef __s8 s8;
+
+typedef __u8 u8;
+
+typedef __s16 s16;
+
+typedef __u16 u16;
+
+typedef __s32 s32;
+
+typedef __u32 u32;
+
+typedef __s64 s64;
+
+typedef __u64 u64;
+
+struct nf_conn {
+	unsigned long status;
+};
+
+struct bpf_ct_opts___local {
+	int netns_id;
+	int error;
+	__u8 l4proto;
+	__u8 dir;
+	__u8 reserved[2];
+} __attribute__((preserve_access_index));
+
+#define BPF_F_CURRENT_NETNS (-1)
+#define IPS_CONFIRMED_BIT  3
+#define	IPS_CONFIRMED      (1 << IPS_CONFIRMED_BIT)
+
+extern struct nf_conn *bpf_xdp_ct_lookup(struct xdp_md *xdp_ctx, struct bpf_sock_tuple *bpf_tuple,
+		  u32 tuple__sz, struct bpf_ct_opts___local *opts, u32 opts__sz) __ksym;
+
+extern void bpf_ct_release(struct nf_conn *ct) __ksym;
+
+// struct ct_key {
+// 	struct bpf_sock_tuple tuple;
+// 	__u8 l4proto;
+// };
 
 #define CHECK_RET(ret)                        \
 	do {                                  \
@@ -99,6 +144,52 @@ static int __always_inline lookup_verdict_udp(struct udphdr *udphdr)
 #define FEATURE_UDP 0
 #define FEATURE_TCP 0
 #endif /* TCP || UDP */
+
+#ifdef FILT_MODE_CT
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 65536);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} MAP_NAME_CT SEC(".maps");
+
+static int __always_inline lookup_verdict_ct(struct xdp_md *ctx, struct bpf_sock_tuple tuple, u8 l4proto)
+{
+		__u32 port;
+		__u64 mask = MAP_FLAG_TCP; // test with tcp conntrack
+		struct bpf_ct_opts___local opts_def = { .reserved[0] = 0, .l4proto = l4proto ,.netns_id = BPF_F_CURRENT_NETNS}; 
+		struct nf_conn *ct;
+
+		ct = bpf_xdp_ct_lookup(ctx, &tuple, sizeof(tuple.ipv4), &opts_def, sizeof(opts_def));
+		// Allow all + deny rules by port number
+		if (ct) {
+			unsigned long status = ct->status;
+			bpf_ct_release(ct);
+			if (status & IPS_CONFIRMED)
+				// mask |= MAP_STATE_CT_ESTABLISHED;
+				return VERDICT_MISS;
+		} else if (opts_def.error != -ENOENT) {
+			// Failed to lookup conntrack
+			return XDP_ABORTED;
+		} else {
+			/* error == -ENOENT || !(status & IPS_CONFIRMED) */
+			mask |= MAP_STATE_CT_NEW;
+
+			port = tuple.ipv4.dport;  
+			CHECK_MAP(&filter_ct, &port, mask | MAP_FLAG_DST);
+			port = tuple.ipv4.sport;  
+			CHECK_MAP(&filter_ct, &port, mask | MAP_FLAG_SRC);	
+		}
+	return VERDICT_MISS;
+}
+// #define CHECK_VERDICT_CT(param) CHECK_VERDICT(ct, param)
+#define FEATURE_CT FEAT_CT
+#else
+#define FEATURE_CT 0
+// #define CHECK_VERDICT_CT(param)
+#endif
 
 #ifdef FILT_MODE_IPV4
 struct {
@@ -209,7 +300,7 @@ int FUNCNAME(struct xdp_md *ctx)
 	CHECK_VERDICT_ETHERNET(eth);
 
 #if defined(FILT_MODE_IPV4) || defined(FILT_MODE_IPV6) || \
-	defined(FILT_MODE_TCP) || defined(FILT_MODE_UDP)
+	defined(FILT_MODE_TCP) || defined(FILT_MODE_UDP) || defined(FILT_MODE_CT)
 	struct iphdr *iphdr;
 	struct ipv6hdr *ipv6hdr;
 	int ip_type;
@@ -232,6 +323,12 @@ int FUNCNAME(struct xdp_md *ctx)
 	if (ip_type == IPPROTO_UDP) {
 		CHECK_RET(parse_udphdr(&nh, data_end, &udphdr));
 		CHECK_VERDICT(udp, udphdr);
+
+// #ifdef FILT_MODE_CT
+// 		l4proto = ip_type;
+// 		tuple.ipv4.dport = udphdr->dest;
+// 		tuple.ipv4.sport = udphdr->source;
+// #endif
 	}
 #endif /* FILT_MODE_UDP */
 
@@ -239,8 +336,18 @@ int FUNCNAME(struct xdp_md *ctx)
 	struct tcphdr *tcphdr;
 	if (ip_type == IPPROTO_TCP) {
 		CHECK_RET(parse_tcphdr(&nh, data_end, &tcphdr));
+#ifdef FILT_MODE_CT
+		struct bpf_sock_tuple tuple;
+		tuple.ipv4.daddr = iphdr->daddr;
+		tuple.ipv4.saddr = iphdr->saddr;
+		tuple.ipv4.dport = tcphdr->dest;
+		tuple.ipv4.sport = tcphdr->source;
+		if ((action = lookup_verdict_ct(ctx, tuple, ip_type)) != XDP_PASS) 
+			goto out;
+#endif
 		CHECK_VERDICT(tcp, tcphdr);
-	}
+
+		}
 #endif /* FILT_MODE_TCP*/
 #endif /* FILT_MODE_{IPV4,IPV6,TCP,UDP} */
 out:
@@ -249,7 +356,7 @@ out:
 
 char _license[] SEC("license") = "GPL";
 __u32 _features SEC("features") = (FEATURE_ETHERNET | FEATURE_IPV4 |
-				   FEATURE_IPV6 | FEATURE_UDP | FEATURE_TCP |
+				   FEATURE_IPV6 | FEATURE_UDP | FEATURE_TCP | FEATURE_CT|
 				   FEATURE_OPMODE);
 
 #else

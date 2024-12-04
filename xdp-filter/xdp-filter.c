@@ -31,6 +31,7 @@ struct flag_val map_flags_all[] = {
 	{"dst", MAP_FLAG_DST},
 	{"tcp", MAP_FLAG_TCP},
 	{"udp", MAP_FLAG_UDP},
+	{"ct", MAP_STATE_CT_NEW},
 	{}
 };
 
@@ -43,6 +44,12 @@ struct flag_val map_flags_srcdst[] = {
 struct flag_val map_flags_tcpudp[] = {
 	{"tcp", MAP_FLAG_TCP},
 	{"udp", MAP_FLAG_UDP},
+	{}
+};
+
+struct flag_val map_flags_ct[] = {
+	{"no", 0},
+	{"new", MAP_STATE_CT_NEW},
 	{}
 };
 
@@ -140,7 +147,7 @@ static int map_set_flags(int fd, void *key, __u8 flags, bool delete_empty)
 	for (i = 0; i < nr_cpus; i++)
 		values[i]  = flags ? (values[i] & ~MAP_FLAGS) | (flags & MAP_FLAGS) : 0;
 
-	pr_debug("Setting new map value %" PRIu64 " from flags %u\n",
+	pr_debug("Setting new map value %" PRIu64 " from flags %b\n",
 		 (uint64_t)values[0], flags);
 
 	err = bpf_map_update_elem(fd, key, values, 0);
@@ -200,6 +207,7 @@ struct flag_val load_features[] = {
 	{"ipv4", FEAT_IPV4},
 	{"ethernet", FEAT_ETHERNET},
 	{"all", FEAT_ALL},
+	{"ct", FEAT_CT},
 	{}
 };
 
@@ -211,6 +219,7 @@ struct flag_val print_features[] = {
 	{"ethernet", FEAT_ETHERNET},
 	{"allow", FEAT_ALLOW},
 	{"deny", FEAT_DENY},
+	{"ct", FEAT_CT},
 	{}
 };
 
@@ -377,6 +386,12 @@ static int remove_unused_maps(const char *pin_root_path, __u32 features)
 
 	if (!(features & FEAT_IPV4)) {
 		err = unlink_pinned_map(dir_fd, textify(MAP_NAME_IPV4));
+		if (err)
+			goto out;
+	}
+
+	if (!(features & FEAT_CT)) {
+		err = unlink_pinned_map(dir_fd, textify(MAP_NAME_CT));
 		if (err)
 			goto out;
 	}
@@ -548,12 +563,15 @@ out:
 	return err;
 }
 
-int print_ports(int map_fd)
+int print_ports(int map_fd, unsigned int ct)
 {
 	__u32 map_key = -1, prev_key = 0;
 	int err;
 
-	printf("Filtered ports:\n");
+	if (ct)
+		printf("Filtered conntrack ports:\n");
+	else
+		printf("Filtered ports:\n");
 	printf("  %-40s Mode             Hit counter\n", "");
 	FOR_EACH_MAP_KEY (err, map_fd, map_key, prev_key) {
 		char buf[100];
@@ -565,7 +583,7 @@ int print_ports(int map_fd)
 			continue;
 		else if (err)
 			return err;
-
+		printf("%b",flags);
 		print_flags(buf, sizeof(buf), map_flags_all, flags);
 		printf("  %-40u %-15s  %" PRIu64 "\n", ntohs(map_key), buf,
 		       (uint64_t)counter);
@@ -579,6 +597,7 @@ static const struct portopt {
 	__u16 port;
 	bool print_status;
 	bool remove;
+	bool ct;
 } defaults_port = {};
 
 static struct prog_option port_options[] = {
@@ -603,6 +622,13 @@ static struct prog_option port_options[] = {
 	DEFINE_OPTION("status", OPT_BOOL, struct portopt, print_status,
 		      .short_opt = 's',
 		      .help = "Print status of filtered ports after changing"),
+	DEFINE_OPTION("conntrack", OPT_FLAGS, struct portopt, ct,
+		      .short_opt = 'c',
+			  .metavar = "<conntrack>",
+			  .typearg = map_flags_ct,
+		      .help = "Enable conntrack rule in this port"
+			          "(current only support allow/deny new connection depend on policy of mode);"
+					  "default is no using conntrack"),
 	END_OPTIONS
 };
 
@@ -610,10 +636,11 @@ static struct prog_option port_options[] = {
 int do_port(const void *cfg, const char *pin_root_path)
 {
 	int map_fd = -1, err = EXIT_SUCCESS, lock_fd;
-	char modestr[100], protostr[100];
+	char modestr[100], protostr[100], ctstr[100];
 	const struct portopt *opt = cfg;
 	unsigned int proto = opt->proto;
 	unsigned int mode = opt->mode;
+	unsigned int ct = opt->ct;
 	struct bpf_map_info info = {};
 	__u8 flags = 0;
 	__u64 counter;
@@ -622,11 +649,15 @@ int do_port(const void *cfg, const char *pin_root_path)
 	lock_fd = prog_lock_acquire(pin_root_path);
 	if (lock_fd < 0)
 		return lock_fd;
+	
+	if (ct) 
+		map_fd = get_pinned_map_fd(pin_root_path, textify(MAP_NAME_CT), &info); 
+	else
+		map_fd = get_pinned_map_fd(pin_root_path, textify(MAP_NAME_PORTS), &info); 
 
-	map_fd = get_pinned_map_fd(pin_root_path, textify(MAP_NAME_PORTS), &info);
 	if (map_fd < 0) {
 		pr_warn("Couldn't find port filter map; is xdp-filter loaded "
-			"with the right features (udp and/or tcp)?\n");
+			"with the right features (udp/tcp and ct)?\n");
 		err = EXIT_FAILURE;
 		goto out;
 	}
@@ -644,31 +675,33 @@ int do_port(const void *cfg, const char *pin_root_path)
 			proto = MAP_FLAG_TCP | MAP_FLAG_UDP;
 		}
 
-		flags &= ~(mode | proto);
+		flags &= ~(mode | proto | ct);
 	} else {
 		if (mode == 0)
 			mode = MAP_FLAG_DST;
 		if (proto == 0)
 			proto = MAP_FLAG_TCP | MAP_FLAG_UDP;
 
-		flags |= mode | proto;
+		flags |= mode | proto | ct;
 	}
 
 	print_flags(modestr, sizeof(modestr), map_flags_srcdst, mode);
 	print_flags(protostr, sizeof(protostr), map_flags_tcpudp, proto);
-	pr_debug("%s %s port %u mode %s\n", opt->remove ? "Removing" : "Adding",
-		 protostr, opt->port, modestr);
+	print_flags(ctstr, sizeof(ctstr), map_flags_ct, ct);
+
+	pr_debug("%s %s port %u mode %s conntrack %s\n", opt->remove ? "Removing" : "Adding",
+		 protostr, opt->port, modestr, ctstr);
 
 	if (!(flags & (MAP_FLAG_DST | MAP_FLAG_SRC)) ||
 	    !(flags & (MAP_FLAG_TCP | MAP_FLAG_UDP)))
 		flags = 0;
-
+	pr_debug("flags ne %b\n",flags);
 	err = map_set_flags(map_fd, &map_key, flags, false);
 	if (err)
 		goto out;
 
 	if (opt->print_status) {
-		err = print_ports(map_fd);
+		err = print_ports(map_fd, ct);
 		if (err)
 			goto out;
 	}
@@ -1005,7 +1038,17 @@ int do_status(__unused const void *cfg, const char *pin_root_path)
 
 	map_fd = get_pinned_map_fd(pin_root_path, textify(MAP_NAME_PORTS), NULL);
 	if (map_fd >= 0) {
-		err = print_ports(map_fd);
+		err = print_ports(map_fd, false);
+		if (err)
+			goto out;
+		printf("\n");
+		close(map_fd);
+		map_fd = -1;
+	}
+
+	map_fd = get_pinned_map_fd(pin_root_path, textify(MAP_NAME_CT), NULL);
+	if (map_fd >= 0) {
+		err = print_ports(map_fd, true);
 		if (err)
 			goto out;
 		printf("\n");

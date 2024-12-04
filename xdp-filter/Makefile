@@ -3,7 +3,7 @@
 XDP_TARGETS  := xdpfilt_dny_udp xdpfilt_dny_tcp xdpfilt_dny_ip \
 	xdpfilt_dny_eth xdpfilt_dny_all \
 	xdpfilt_alw_udp xdpfilt_alw_tcp xdpfilt_alw_ip \
-	xdpfilt_alw_eth xdpfilt_alw_all
+	xdpfilt_alw_eth xdpfilt_alw_all xdpfilt_alw_ct
 
 TOOL_NAME := xdp-filter
 USER_TARGETS := xdp-filter
