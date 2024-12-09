@@ -147,7 +147,7 @@ static int map_set_flags(int fd, void *key, __u8 flags, bool delete_empty)
 	for (i = 0; i < nr_cpus; i++)
 		values[i]  = flags ? (values[i] & ~MAP_FLAGS) | (flags & MAP_FLAGS) : 0;
 
-	pr_debug("Setting new map value %" PRIu64 " from flags %b\n",
+	pr_debug("Setting new map value %" PRIu64 " from flags %x\n",
 		 (uint64_t)values[0], flags);
 
 	err = bpf_map_update_elem(fd, key, values, 0);
@@ -583,7 +583,7 @@ int print_ports(int map_fd, unsigned int ct)
 			continue;
 		else if (err)
 			return err;
-		printf("%b",flags);
+
 		print_flags(buf, sizeof(buf), map_flags_all, flags);
 		printf("  %-40u %-15s  %" PRIu64 "\n", ntohs(map_key), buf,
 		       (uint64_t)counter);
@@ -695,7 +695,7 @@ int do_port(const void *cfg, const char *pin_root_path)
 	if (!(flags & (MAP_FLAG_DST | MAP_FLAG_SRC)) ||
 	    !(flags & (MAP_FLAG_TCP | MAP_FLAG_UDP)))
 		flags = 0;
-	pr_debug("flags ne %b\n",flags);
+	// pr_debug("flags ne %x\n",flags);
 	err = map_set_flags(map_fd, &map_key, flags, false);
 	if (err)
 		goto out;
