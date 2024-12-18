@@ -70,10 +70,11 @@ extern struct nf_conn *bpf_xdp_ct_lookup(struct xdp_md *xdp_ctx, struct bpf_sock
 
 extern void bpf_ct_release(struct nf_conn *ct) __ksym;
 
-// struct ct_key {
-// 	struct bpf_sock_tuple tuple;
-// 	__u8 l4proto;
-// };
+struct ct_key {
+	struct xdp_md *ctx;
+	struct bpf_sock_tuple tuple;
+	__u8 l4proto;
+};
 
 #define CHECK_RET(ret)                        \
 	do {                                  \
@@ -155,40 +156,41 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } MAP_NAME_CT SEC(".maps");
 
-static int __always_inline lookup_verdict_ct(struct xdp_md *ctx, struct bpf_sock_tuple tuple, u8 l4proto)
+static int __always_inline lookup_verdict_ct(struct ct_key conntrack)
 {
-		__u32 port;
-		__u64 mask = MAP_FLAG_TCP; // test with tcp conntrack
-		struct bpf_ct_opts___local opts_def = { .reserved[0] = 0, .l4proto = l4proto ,.netns_id = BPF_F_CURRENT_NETNS}; 
-		struct nf_conn *ct;
+	__u32 port;
+	__u64 mask = MAP_FLAG_TCP; // test with tcp conntrack
+	struct bpf_ct_opts___local opts_def = { .reserved[0] = 0, .l4proto = conntrack.l4proto ,.netns_id = BPF_F_CURRENT_NETNS}; 
+	struct nf_conn *ct;
 
-		ct = bpf_xdp_ct_lookup(ctx, &tuple, sizeof(tuple.ipv4), &opts_def, sizeof(opts_def));
-		// Allow all + deny rules by port number
-		if (ct) {
-			unsigned long status = ct->status;
-			bpf_ct_release(ct);
-			if (status & IPS_CONFIRMED)
-				// mask |= MAP_STATE_CT_ESTABLISHED;
-				return VERDICT_MISS;
-		} else if (opts_def.error != -ENOENT) {
-			// Failed to lookup conntrack
-			return XDP_ABORTED;
-		} else {
-			/* error == -ENOENT || !(status & IPS_CONFIRMED) */
-			mask |= MAP_STATE_CT_NEW;
+	ct = bpf_xdp_ct_lookup(conntrack.ctx, &conntrack.tuple, sizeof(conntrack.tuple.ipv4), &opts_def, sizeof(opts_def));
+	// Allow all + deny rules by port number
+	if (ct) {
+		unsigned long status = ct->status;
+		bpf_ct_release(ct);
+		if (status & IPS_CONFIRMED)
+			// mask |= MAP_STATE_CT_ESTABLISHED;
+			return VERDICT_MISS;
+	} else if (opts_def.error != -ENOENT) {
+		// Failed to lookup conntrack
+		return XDP_ABORTED;
+	} else {
+		/* error == -ENOENT || !(status & IPS_CONFIRMED) */
+		mask |= MAP_STATE_CT_NEW;
 
-			port = tuple.ipv4.dport;  
-			CHECK_MAP(&filter_ct, &port, mask | MAP_FLAG_DST);
-			port = tuple.ipv4.sport;  
-			CHECK_MAP(&filter_ct, &port, mask | MAP_FLAG_SRC);	
-		}
+		port = conntrack.tuple.ipv4.dport;  
+		CHECK_MAP(&filter_ct, &port, mask | MAP_FLAG_DST);
+		port = conntrack.tuple.ipv4.sport;  
+		CHECK_MAP(&filter_ct, &port, mask | MAP_FLAG_SRC);	
+	}
 	return VERDICT_MISS;
 }
-// #define CHECK_VERDICT_CT(param) CHECK_VERDICT(ct, param)
+
+#define CHECK_VERDICT_CT(param) CHECK_VERDICT(ct, param)
 #define FEATURE_CT FEAT_CT
 #else
 #define FEATURE_CT 0
-// #define CHECK_VERDICT_CT(param)
+#define CHECK_VERDICT_CT(param)
 #endif
 
 #ifdef FILT_MODE_IPV4
@@ -307,7 +309,6 @@ int FUNCNAME(struct xdp_md *ctx)
 	if (eth_type == bpf_htons(ETH_P_IP)) {
 		ip_type = parse_iphdr(&nh, data_end, &iphdr);
 		CHECK_RET(ip_type);
-
 		CHECK_VERDICT_IPV4(iphdr);
 	} else if (eth_type == bpf_htons(ETH_P_IPV6)) {
 		ip_type = parse_ip6hdr(&nh, data_end, &ipv6hdr);
@@ -324,11 +325,17 @@ int FUNCNAME(struct xdp_md *ctx)
 		CHECK_RET(parse_udphdr(&nh, data_end, &udphdr));
 		CHECK_VERDICT(udp, udphdr);
 
-// #ifdef FILT_MODE_CT
-// 		l4proto = ip_type;
-// 		tuple.ipv4.dport = udphdr->dest;
-// 		tuple.ipv4.sport = udphdr->source;
-// #endif
+#ifdef FILT_MODE_CT
+		struct ct_key conntrack = {
+			.ctx = ctx,
+			.tuple.ipv4.daddr = iphdr->daddr,
+			.tuple.ipv4.saddr = iphdr->saddr,
+			.tuple.ipv4.dport = udphdr->dest,
+			.tuple.ipv4.sport = udphdr->source,
+			.l4proto = ip_type
+		};
+		CHECK_VERDICT_CT(conntrack);
+#endif
 	}
 #endif /* FILT_MODE_UDP */
 
@@ -337,13 +344,15 @@ int FUNCNAME(struct xdp_md *ctx)
 	if (ip_type == IPPROTO_TCP) {
 		CHECK_RET(parse_tcphdr(&nh, data_end, &tcphdr));
 #ifdef FILT_MODE_CT
-		struct bpf_sock_tuple tuple;
-		tuple.ipv4.daddr = iphdr->daddr;
-		tuple.ipv4.saddr = iphdr->saddr;
-		tuple.ipv4.dport = tcphdr->dest;
-		tuple.ipv4.sport = tcphdr->source;
-		if ((action = lookup_verdict_ct(ctx, tuple, ip_type)) != XDP_PASS) 
-			goto out;
+		struct ct_key conntrack = {
+			.ctx = ctx,
+			.tuple.ipv4.daddr = iphdr->daddr,
+			.tuple.ipv4.saddr = iphdr->saddr,
+			.tuple.ipv4.dport = tcphdr->dest,
+			.tuple.ipv4.sport = tcphdr->source,
+			.l4proto = ip_type
+		};
+		CHECK_VERDICT_CT(conntrack);
 #endif
 		CHECK_VERDICT(tcp, tcphdr);
 
